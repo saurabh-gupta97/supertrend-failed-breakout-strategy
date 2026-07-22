@@ -253,9 +253,7 @@ def generate_signals(
     return signal_data
 
 
-from typing import Literal, Any
-import numpy as np
-import pandas as pd
+
 
 def backtest_strategy(
     signal_data: pd.DataFrame,
