@@ -1,0 +1,695 @@
+"""
+Utilities for calculating the Supertrend indicator.
+
+The implementation follows the standard Supertrend construction:
+
+    1. True Range
+    2. Wilder's Average True Range
+    3. Basic upper and lower bands
+    4. Final upper and lower bands
+    5. Trend state
+    6. Supertrend line
+
+All calculations are causal: the value at timestamp t depends only on
+OHLC data available at or before timestamp t.
+"""
+
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+
+def calculate_average_true_range(
+    ohlcv_data: pd.DataFrame,
+    atr_period: int,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Calculate True Range and Wilder's Average True Range.
+
+    The True Range at time t is defined as:
+
+        TR_t = max(
+            high_t - low_t,
+            |high_t - close_{t-1}|,
+            |low_t - close_{t-1}|
+        )
+
+    Wilder's ATR is initialized using the arithmetic mean of the first
+    `atr_period` True Range observations and subsequently updated as:
+
+        ATR_t =
+            ((atr_period - 1) * ATR_{t-1} + TR_t)
+            / atr_period
+
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        OHLCV data containing the columns:
+
+            - "high"
+            - "low"
+            - "close"
+
+        The DataFrame should be chronologically sorted.
+
+    atr_period : int
+        Number of observations used for ATR calculation.
+
+    Returns
+    -------
+    Tuple[pd.Series, pd.Series]
+        A tuple containing:
+
+            true_range :
+                True Range for each observation.
+
+            average_true_range :
+                Wilder's Average True Range.
+
+    Raises
+    ------
+    ValueError
+        If `atr_period` is not a positive integer.
+
+    KeyError
+        If the required OHLC columns are missing.
+    """
+
+    if not isinstance(atr_period, int):
+        raise TypeError(
+            "atr_period must be an integer."
+        )
+
+    if atr_period <= 0:
+        raise ValueError(
+            "atr_period must be greater than zero."
+        )
+
+    required_columns = {
+        "high",
+        "low",
+        "close",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(ohlcv_data.columns)
+    )
+
+    if missing_columns:
+        raise KeyError(
+            "Missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    previous_close = (
+        ohlcv_data["close"].shift(1)
+    )
+
+    true_range = pd.concat(
+        [
+            (
+                ohlcv_data["high"]
+                - ohlcv_data["low"]
+            ),
+
+            (
+                ohlcv_data["high"]
+                - previous_close
+            ).abs(),
+
+            (
+                ohlcv_data["low"]
+                - previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    average_true_range = (
+        true_range
+        .ewm(
+            alpha=1 / atr_period,
+            adjust=False,
+            min_periods=atr_period,
+        )
+        .mean()
+    )
+
+    return (
+        true_range,
+        average_true_range,
+    )
+
+
+def calculate_supertrend_bands(
+    ohlcv_data: pd.DataFrame,
+    average_true_range: pd.Series,
+    multiplier: float,
+) -> Tuple[
+    pd.Series,
+    pd.Series,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Calculate the basic and final Supertrend bands.
+
+    The midpoint is:
+
+        HL2_t = (high_t + low_t) / 2
+
+    The basic bands are:
+
+        BUB_t = HL2_t + multiplier * ATR_t
+
+        BLB_t = HL2_t - multiplier * ATR_t
+
+    The final upper band is:
+
+        FUB_t =
+            BUB_t,
+            if BUB_t < FUB_{t-1}
+            or close_{t-1} > FUB_{t-1}
+
+            FUB_{t-1},
+            otherwise
+
+    The final lower band is:
+
+        FLB_t =
+            BLB_t,
+            if BLB_t > FLB_{t-1}
+            or close_{t-1} < FLB_{t-1}
+
+            FLB_{t-1},
+            otherwise
+
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        OHLCV data containing "high", "low", and "close".
+
+    average_true_range : pd.Series
+        Wilder's Average True Range, aligned with `ohlcv_data`.
+
+    multiplier : float
+        ATR multiplier used to determine the distance of the bands
+        from the midpoint.
+
+    Returns
+    -------
+    Tuple[
+        pd.Series,
+        pd.Series,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]
+        Returns:
+
+            basic_upper_band :
+                Raw upper Supertrend band.
+
+            basic_lower_band :
+                Raw lower Supertrend band.
+
+            final_upper_band :
+                Recursive final upper band.
+
+            final_lower_band :
+                Recursive final lower band.
+
+            supertrend :
+                Active Supertrend line.
+
+            trend :
+                Trend state:
+
+                    -1.0 : downtrend
+                    +1.0 : uptrend
+
+    Raises
+    ------
+    ValueError
+        If no valid ATR observations are available.
+    """
+
+    if multiplier <= 0:
+        raise ValueError(
+            "multiplier must be greater than zero."
+        )
+
+    high = (
+        ohlcv_data["high"]
+        .to_numpy(
+            dtype=np.float64
+        )
+    )
+
+    low = (
+        ohlcv_data["low"]
+        .to_numpy(
+            dtype=np.float64
+        )
+    )
+
+    close = (
+        ohlcv_data["close"]
+        .to_numpy(
+            dtype=np.float64
+        )
+    )
+
+    average_true_range_array = (
+        average_true_range
+        .to_numpy(
+            dtype=np.float64
+        )
+    )
+
+    number_of_observations = (
+        len(close)
+    )
+
+    midpoint = (
+        high + low
+    ) / 2.0
+
+    basic_upper_band = (
+        midpoint
+        + multiplier
+        * average_true_range_array
+    )
+
+    basic_lower_band = (
+        midpoint
+        - multiplier
+        * average_true_range_array
+    )
+
+    final_upper_band = np.full(
+        number_of_observations,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    final_lower_band = np.full(
+        number_of_observations,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    supertrend = np.full(
+        number_of_observations,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    trend = np.full(
+        number_of_observations,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    valid_indices = np.flatnonzero(
+        ~np.isnan(
+            average_true_range_array
+        )
+    )
+
+    if len(valid_indices) == 0:
+        raise ValueError(
+            "No valid ATR observations. "
+            "Check the input data and atr_period."
+        )
+
+    first_valid = (
+        valid_indices[0]
+    )
+
+    # --------------------------------------------------
+    # Initialisation
+    # --------------------------------------------------
+
+    final_upper_band[first_valid] = (
+        basic_upper_band[first_valid]
+    )
+
+    final_lower_band[first_valid] = (
+        basic_lower_band[first_valid]
+    )
+
+    if (
+        close[first_valid]
+        <= final_upper_band[first_valid]
+    ):
+
+        trend[first_valid] = -1.0
+
+        supertrend[first_valid] = (
+            final_upper_band[first_valid]
+        )
+
+    else:
+
+        trend[first_valid] = 1.0
+
+        supertrend[first_valid] = (
+            final_lower_band[first_valid]
+        )
+
+    # --------------------------------------------------
+    # Recursive calculation
+    # --------------------------------------------------
+
+    for observation_index in range(
+        first_valid + 1,
+        number_of_observations,
+    ):
+
+        previous_index = (
+            observation_index - 1
+        )
+
+        # ----------------------------------------------
+        # Final upper band
+        # ----------------------------------------------
+
+        if (
+            (
+                basic_upper_band[
+                    observation_index
+                ]
+                <
+                final_upper_band[
+                    previous_index
+                ]
+            )
+            or
+            (
+                close[previous_index]
+                >
+                final_upper_band[
+                    previous_index
+                ]
+            )
+        ):
+
+            final_upper_band[
+                observation_index
+            ] = (
+                basic_upper_band[
+                    observation_index
+                ]
+            )
+
+        else:
+
+            final_upper_band[
+                observation_index
+            ] = (
+                final_upper_band[
+                    previous_index
+                ]
+            )
+
+        # ----------------------------------------------
+        # Final lower band
+        # ----------------------------------------------
+
+        if (
+            (
+                basic_lower_band[
+                    observation_index
+                ]
+                >
+                final_lower_band[
+                    previous_index
+                ]
+            )
+            or
+            (
+                close[previous_index]
+                <
+                final_lower_band[
+                    previous_index
+                ]
+            )
+        ):
+
+            final_lower_band[
+                observation_index
+            ] = (
+                basic_lower_band[
+                    observation_index
+                ]
+            )
+
+        else:
+
+            final_lower_band[
+                observation_index
+            ] = (
+                final_lower_band[
+                    previous_index
+                ]
+            )
+
+        # ----------------------------------------------
+        # Trend transition
+        # ----------------------------------------------
+
+        if (
+            trend[previous_index]
+            == -1.0
+        ):
+
+            if (
+                close[observation_index]
+                >
+                final_upper_band[
+                    observation_index
+                ]
+            ):
+
+                trend[
+                    observation_index
+                ] = 1.0
+
+                supertrend[
+                    observation_index
+                ] = (
+                    final_lower_band[
+                        observation_index
+                    ]
+                )
+
+            else:
+
+                trend[
+                    observation_index
+                ] = -1.0
+
+                supertrend[
+                    observation_index
+                ] = (
+                    final_upper_band[
+                        observation_index
+                    ]
+                )
+
+        else:
+
+            if (
+                close[observation_index]
+                <
+                final_lower_band[
+                    observation_index
+                ]
+            ):
+
+                trend[
+                    observation_index
+                ] = -1.0
+
+                supertrend[
+                    observation_index
+                ] = (
+                    final_upper_band[
+                        observation_index
+                    ]
+                )
+
+            else:
+
+                trend[
+                    observation_index
+                ] = 1.0
+
+                supertrend[
+                    observation_index
+                ] = (
+                    final_lower_band[
+                        observation_index
+                    ]
+                )
+
+    return (
+        basic_upper_band,
+        basic_lower_band,
+        final_upper_band,
+        final_lower_band,
+        supertrend,
+        trend,
+    )
+
+
+def calculate_supertrend(
+    ohlcv_data: pd.DataFrame,
+    atr_period: int = 10,
+    multiplier: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Calculate the Supertrend indicator and append its components
+    to an OHLCV DataFrame.
+
+    The calculation proceeds as:
+
+        OHLCV data
+            ↓
+        True Range
+            ↓
+        Wilder ATR
+            ↓
+        Basic bands
+            ↓
+        Final bands
+            ↓
+        Trend state
+            ↓
+        Supertrend line
+
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        Chronologically sorted OHLCV data containing:
+
+            - "open"
+            - "high"
+            - "low"
+            - "close"
+
+    atr_period : int, default=10
+        Number of observations used in the ATR calculation.
+
+    multiplier : float, default=3.0
+        ATR multiplier used to construct the Supertrend bands.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input OHLCV DataFrame with the following
+        additional columns:
+
+            - "true_range"
+            - "atr"
+            - "basic_upper_band"
+            - "basic_lower_band"
+            - "final_upper_band"
+            - "final_lower_band"
+            - "supertrend"
+            - "trend"
+
+    Notes
+    -----
+    The calculation is causal. The Supertrend value at observation t
+    depends only on OHLC data available through observation t.
+    """
+
+    supertrend_data = (
+        ohlcv_data.copy()
+    )
+
+    # --------------------------------------------------
+    # 1. True Range and ATR
+    # --------------------------------------------------
+
+    (
+        true_range,
+        average_true_range,
+    ) = calculate_average_true_range(
+        ohlcv_data=supertrend_data,
+        atr_period=atr_period,
+    )
+
+    # --------------------------------------------------
+    # 2. Supertrend bands and trend
+    # --------------------------------------------------
+
+    (
+        basic_upper_band,
+        basic_lower_band,
+        final_upper_band,
+        final_lower_band,
+        supertrend,
+        trend,
+    ) = calculate_supertrend_bands(
+        ohlcv_data=supertrend_data,
+        average_true_range=average_true_range,
+        multiplier=multiplier,
+    )
+
+    # --------------------------------------------------
+    # 3. Add calculated quantities
+    # --------------------------------------------------
+
+    supertrend_data["true_range"] = (
+        true_range
+    )
+
+    supertrend_data["atr"] = (
+        average_true_range
+    )
+
+    supertrend_data[
+        "basic_upper_band"
+    ] = (
+        basic_upper_band
+    )
+
+    supertrend_data[
+        "basic_lower_band"
+    ] = (
+        basic_lower_band
+    )
+
+    supertrend_data[
+        "final_upper_band"
+    ] = (
+        final_upper_band
+    )
+
+    supertrend_data[
+        "final_lower_band"
+    ] = (
+        final_lower_band
+    )
+
+    supertrend_data[
+        "supertrend"
+    ] = (
+        supertrend
+    )
+
+    supertrend_data[
+        "trend"
+    ] = (
+        trend
+    )
+
+    return supertrend_data
+
