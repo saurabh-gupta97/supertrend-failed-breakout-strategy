@@ -47,7 +47,7 @@ Trade monitoring begins from the following candle.
 This module assumes that the input data is chronologically sorted.
 """
 
-from typing import Literal, Any
+from typing import Literal, Dict, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -112,6 +112,7 @@ def _validate_backtest_columns(
     required_columns = {
         "low",
         "high",
+        "open",
         "close",
         "long_signal",
         "short_signal",
@@ -252,7 +253,247 @@ def generate_signals(
     return signal_data
 
 
+from typing import Literal, Any
+import numpy as np
+import pandas as pd
+
 def backtest_strategy(
+    signal_data: pd.DataFrame,
+    reward_risk: float = 2.0,
+    same_bar_priority: Literal["stop", "target"] = "stop",
+    slippage_ticks: float = 0.0,
+    tick_size: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Backtest the Supertrend Failed Breakout strategy using fast NumPy iteration.
+
+    Entry (Corrected for Look-Ahead Bias)
+    -------------------------------------
+    A signal is generated based on the closing price of observation t.
+    Because the close must be confirmed, the trade is executed at the OPEN of 
+    the following candle (t + 1), incorporating transaction slippage.
+
+    Long entry:
+        entry_price = open_{t+1} + (slippage_ticks * tick_size)
+
+    Short entry:
+        entry_price = open_{t+1} - (slippage_ticks * tick_size)
+
+    Trade construction
+    ------------------
+    The stop loss is anchored to the extremes of the signal candle (t).
+
+    Long:
+        stop_loss = low_t
+        risk = entry_price - stop_loss
+        take_profit = entry_price + reward_risk * risk
+
+    Short:
+        stop_loss = high_t
+        risk = stop_loss - entry_price
+        take_profit = entry_price - reward_risk * risk
+
+    Trade management
+    ----------------
+    Only one position may be open at a time. Monitoring begins immediately on 
+    the execution candle (t+1). If both stop-loss and take-profit are touched 
+    during the same candle, the result is determined by `same_bar_priority`.
+    Slippage is applied upon exiting the position.
+
+    Parameters
+    ----------
+    signal_data : pd.DataFrame
+        Chronologically sorted OHLCV data containing:
+            - "open", "low", "high", "close", "long_signal", "short_signal"
+    reward_risk : float, default=2.0
+        Reward-to-risk ratio.
+    same_bar_priority : {"stop", "target"}, default="stop"
+        Outcome when both stop-loss and take-profit are reached within the same bar.
+    slippage_ticks : float, default=0.0
+        Execution penalty defined in ticks (e.g., bid-ask spread friction).
+    tick_size : float, default=0.01
+        The minimum price movement of the asset.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per completed trade.
+    """
+
+    _validate_backtest_columns(signal_data)
+
+    if reward_risk <= 0:
+        raise ValueError("reward_risk must be greater than zero.")
+
+    if same_bar_priority not in {"stop", "target"}:
+        raise ValueError("same_bar_priority must be 'stop' or 'target'.")
+
+    trades: list[dict] = []
+    open_position: dict | None = None
+    number_of_observations = len(signal_data)
+
+    # Extract pandas columns to underlying NumPy arrays for extreme speed O(1) lookups
+    opens = signal_data["open"].to_numpy(dtype=np.float64)
+    highs = signal_data["high"].to_numpy(dtype=np.float64)
+    lows = signal_data["low"].to_numpy(dtype=np.float64)
+    long_signals = signal_data["long_signal"].to_numpy(dtype=bool)
+    short_signals = signal_data["short_signal"].to_numpy(dtype=bool)
+    timestamps = signal_data.index.to_numpy()
+
+    for observation_index in range(number_of_observations):
+
+        # ==================================================
+        # NO OPEN POSITION
+        # ==================================================
+        if open_position is None:
+
+            # Cannot execute a new trade if we are on the final dataset observation
+            if observation_index + 1 >= number_of_observations:
+                continue
+
+            # ----------------------------------------------
+            # Long entry
+            # ----------------------------------------------
+            if long_signals[observation_index]:
+                entry_index = observation_index + 1
+                entry_time = timestamps[entry_index]
+                
+                # Execute on the open of the next bar, penalize with slippage
+                entry_price = opens[entry_index] + (slippage_ticks * tick_size)
+                
+                # Stop loss anchored to the signal bar's low
+                stop_loss = lows[observation_index]
+                risk = entry_price - stop_loss
+                
+                if risk <= 0:
+                    continue  # Gap opened past our intended stop loss
+                    
+                take_profit = entry_price + (reward_risk * risk)
+                
+                open_position = {
+                    "direction": "long",
+                    "entry_time": entry_time,
+                    "entry_index": entry_index,
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "risk": risk,
+                }
+                continue
+
+            # ----------------------------------------------
+            # Short entry
+            # ----------------------------------------------
+            if short_signals[observation_index]:
+                entry_index = observation_index + 1
+                entry_time = timestamps[entry_index]
+                
+                # Execute on the open of the next bar, penalize with slippage
+                entry_price = opens[entry_index] - (slippage_ticks * tick_size)
+                
+                # Stop loss anchored to the signal bar's high
+                stop_loss = highs[observation_index]
+                risk = stop_loss - entry_price
+                
+                if risk <= 0:
+                    continue  # Gap opened past our intended stop loss
+                    
+                take_profit = entry_price - (reward_risk * risk)
+                
+                open_position = {
+                    "direction": "short",
+                    "entry_time": entry_time,
+                    "entry_index": entry_index,
+                    "entry_price": entry_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "risk": risk,
+                }
+                continue
+
+        # ==================================================
+        # MANAGE OPEN POSITION
+        # ==================================================
+        else:
+            current_high = highs[observation_index]
+            current_low = lows[observation_index]
+            current_timestamp = timestamps[observation_index]
+
+            exit_reason = None
+            exit_price = None
+
+            # --------------------------------------------------
+            # Long position
+            # --------------------------------------------------
+            if open_position["direction"] == "long":
+                stop_hit = current_low <= open_position["stop_loss"]
+                target_hit = current_high >= open_position["take_profit"]
+
+                if stop_hit and target_hit:
+                    if same_bar_priority == "stop":
+                        exit_reason = "stop_loss"
+                        exit_price = open_position["stop_loss"]
+                    else:
+                        exit_reason = "take_profit"
+                        exit_price = open_position["take_profit"]
+                elif stop_hit:
+                    exit_reason = "stop_loss"
+                    exit_price = open_position["stop_loss"]
+                elif target_hit:
+                    exit_reason = "take_profit"
+                    exit_price = open_position["take_profit"]
+                else:
+                    continue
+
+                # Apply friction to the exit
+                exit_price -= (slippage_ticks * tick_size)
+                pnl = exit_price - open_position["entry_price"]
+
+            # --------------------------------------------------
+            # Short position
+            # --------------------------------------------------
+            else:
+                stop_hit = current_high >= open_position["stop_loss"]
+                target_hit = current_low <= open_position["take_profit"]
+
+                if stop_hit and target_hit:
+                    if same_bar_priority == "stop":
+                        exit_reason = "stop_loss"
+                        exit_price = open_position["stop_loss"]
+                    else:
+                        exit_reason = "take_profit"
+                        exit_price = open_position["take_profit"]
+                elif stop_hit:
+                    exit_reason = "stop_loss"
+                    exit_price = open_position["stop_loss"]
+                elif target_hit:
+                    exit_reason = "take_profit"
+                    exit_price = open_position["take_profit"]
+                else:
+                    continue
+                
+                # Apply friction to the exit
+                exit_price += (slippage_ticks * tick_size)
+                pnl = open_position["entry_price"] - exit_price
+
+            r_multiple = pnl / open_position["risk"]
+
+            completed_trade = {
+                **open_position,
+                "exit_time": current_timestamp,
+                "exit_index": observation_index,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "pnl": pnl,
+                "r_multiple": r_multiple,
+            }
+
+            trades.append(completed_trade)
+            open_position = None
+
+    return pd.DataFrame(trades)
+
+'''def backtest_strategy(
     signal_data: pd.DataFrame,
     reward_risk: float = 2.0,
     same_bar_priority: Literal[
@@ -727,11 +968,11 @@ def backtest_strategy(
 
             open_position = None
 
-    return pd.DataFrame(trades)
+    return pd.DataFrame(trades)'''
 
 
 
-def calculate_performance(
+'''def calculate_performance(
     trades: pd.DataFrame,
     initial_capital: float = 100_000.0,
     annualization_factor: int = 252,
@@ -1126,5 +1367,151 @@ def calculate_performance(
     return (
         performance_over_time,
         performance_metrics
-    )
+    )'''
 
+
+def calculate_performance(
+    trades_data: pd.DataFrame,
+    initial_capital: float = 100000.0,
+    risk_free_rate: float = 0.0,
+    trading_days_per_year: int = 252,
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """
+    Calculate institutional-grade performance metrics from trade executions.
+
+    This function constructs a daily equity curve from the discrete trade log 
+    to calculate mathematically valid time-series risk metrics (Sharpe, 
+    Sortino, Max Drawdown). 
+
+    Parameters
+    ----------
+    trades_data : pd.DataFrame
+        A DataFrame containing completed trades. Must include at least:
+            - "exit_time": Datetime of trade exit.
+            - "pnl": The realized profit or loss of the trade.
+            - "r_multiple": The risk-adjusted return of the trade.
+    initial_capital : float, default=100000.0
+        The starting capital for the backtest.
+    risk_free_rate : float, default=0.0
+        The annualized risk-free rate used for Sharpe and Sortino calculations.
+    trading_days_per_year : int, default=252
+        Number of trading days in a year, used for annualization.
+
+    Returns
+    -------
+    Tuple[Dict[str, float], pd.DataFrame]
+        - A dictionary containing scalar performance metrics (KPIs).
+        - A DataFrame containing the daily time-series equity curve and 
+          drawdowns, intended to be passed directly to `plotting_utils.py`.
+    """
+
+    if trades_data.empty:
+        return {}, pd.DataFrame()
+
+    # ==================================================
+    # 1. Trade-level statistics
+    # ==================================================
+    total_trades = len(trades_data)
+    winning_trades = trades_data[trades_data["pnl"] > 0]
+    losing_trades = trades_data[trades_data["pnl"] < 0]
+
+    win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0.0
+    
+    gross_profit = winning_trades["pnl"].sum()
+    gross_loss = abs(losing_trades["pnl"].sum())
+    
+    # Profit factor: Gross Profit / Gross Loss
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+    average_r_multiple = trades_data["r_multiple"].mean() if "r_multiple" in trades_data.columns else np.nan
+
+    # ==================================================
+    # 2. Daily Equity Curve Construction
+    # ==================================================
+    # Group PnL by the day the trade exited to build a continuous time series
+    trades_data["exit_date"] = pd.to_datetime(trades_data["exit_time"]).dt.normalize()
+    daily_pnl = trades_data.groupby("exit_date")["pnl"].sum()
+    
+    # Fill in days where no trades occurred with 0.0 PnL to maintain time-series integrity
+    full_date_range = pd.date_range(start=daily_pnl.index.min(), end=daily_pnl.index.max(), freq="B")
+    daily_pnl = daily_pnl.reindex(full_date_range, fill_value=0.0)
+
+    cumulative_pnl = daily_pnl.cumsum()
+    equity_curve = initial_capital + cumulative_pnl
+    
+    # Calculate daily percentage returns
+    daily_returns = equity_curve.pct_change().fillna(0.0)
+
+    # ==================================================
+    # 3. Drawdown Calculations
+    # ==================================================
+    rolling_peak = equity_curve.cummax()
+    drawdown_absolute = equity_curve - rolling_peak
+    drawdown_percent = drawdown_absolute / rolling_peak
+    
+    maximum_drawdown_percent = abs(drawdown_percent.min())
+    maximum_drawdown_absolute = abs(drawdown_absolute.min())
+
+    # ==================================================
+    # 4. Risk-Adjusted Returns (Annualized)
+    # ==================================================
+    daily_rf_rate = risk_free_rate / trading_days_per_year
+    excess_returns = daily_returns - daily_rf_rate
+
+    # Sharpe Ratio
+    return_standard_deviation = daily_returns.std()
+    if return_standard_deviation > 0:
+        annualized_sharpe_ratio = (excess_returns.mean() / return_standard_deviation) * np.sqrt(trading_days_per_year)
+    else:
+        annualized_sharpe_ratio = 0.0
+
+    # Sortino Ratio (Penalizes only downside volatility)
+    negative_returns = excess_returns[excess_returns < 0]
+    downside_standard_deviation = negative_returns.std()
+    if downside_standard_deviation > 0:
+        annualized_sortino_ratio = (excess_returns.mean() / downside_standard_deviation) * np.sqrt(trading_days_per_year)
+    else:
+        annualized_sortino_ratio = np.inf if excess_returns.mean() > 0 else 0.0
+
+    # Calmar Ratio (Annualized Return / Max Drawdown)
+    total_return_percent = (equity_curve.iloc[-1] / initial_capital) - 1.0
+    years_in_market = len(daily_returns) / trading_days_per_year
+    
+    if years_in_market > 0:
+        annualized_return = ((1 + total_return_percent) ** (1 / years_in_market)) - 1.0
+    else:
+        annualized_return = 0.0
+
+    calmar_ratio = annualized_return / maximum_drawdown_percent if maximum_drawdown_percent > 0 else np.inf
+
+    # ==================================================
+    # 5. Compile Results
+    # ==================================================
+    performance_metrics = {
+        "total_trades": total_trades,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "average_r_multiple": average_r_multiple,
+        "total_pnl": trades_data["pnl"].sum(),
+        "total_return_percent": total_return_percent,
+        "annualized_return_percent": annualized_return,
+        "maximum_drawdown_absolute": maximum_drawdown_absolute,
+        "maximum_drawdown_percent": maximum_drawdown_percent,
+        "annualized_sharpe_ratio": annualized_sharpe_ratio,
+        "annualized_sortino_ratio": annualized_sortino_ratio,
+        "calmar_ratio": calmar_ratio,
+    }
+
+    # Drop the temporary date column from the original trades dataframe
+    trades_data.drop(columns=["exit_date"], inplace=True)
+
+    # Prepare plotting data structure
+    performance_plot_data = pd.DataFrame({
+        "exit_time": equity_curve.index, # Align index for plotting
+        "equity": equity_curve.values,
+        "cumulative_pnl": cumulative_pnl.values,
+        "drawdown_absolute": drawdown_absolute.values,
+        "drawdown_percent": drawdown_percent.values,
+    })
+
+    return performance_metrics, performance_plot_data

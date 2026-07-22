@@ -13,11 +13,12 @@ The implementation follows the standard Supertrend construction:
 All calculations are causal: the value at timestamp t depends only on
 OHLC data available at or before timestamp t.
 """
-
 from typing import Tuple
-
 import numpy as np
 import pandas as pd
+from numba import njit
+
+
 
 def calculate_average_true_range(
     ohlcv_data: pd.DataFrame,
@@ -142,7 +143,7 @@ def calculate_average_true_range(
     )
 
 
-def calculate_supertrend_bands(
+'''def calculate_supertrend_bands(
     ohlcv_data: pd.DataFrame,
     average_true_range: pd.Series,
     multiplier: float,
@@ -545,7 +546,159 @@ def calculate_supertrend_bands(
         final_lower_band,
         supertrend,
         trend,
+    )'''
+
+
+
+@njit(cache=True)
+def _calculate_supertrend_bands_core(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    average_true_range_array: np.ndarray,
+    multiplier: float,
+    number_of_observations: int,
+    first_valid: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Core Numba-compiled recursive calculation for Supertrend bands.
+    Runs at C-speed outside of the global interpreter lock (GIL).
+    """
+    midpoint = (high + low) / 2.0
+    basic_upper_band = midpoint + multiplier * average_true_range_array
+    basic_lower_band = midpoint - multiplier * average_true_range_array
+
+    final_upper_band = np.full(number_of_observations, np.nan, dtype=np.float64)
+    final_lower_band = np.full(number_of_observations, np.nan, dtype=np.float64)
+    supertrend = np.full(number_of_observations, np.nan, dtype=np.float64)
+    trend = np.full(number_of_observations, np.nan, dtype=np.float64)
+
+    # Initialisation
+    final_upper_band[first_valid] = basic_upper_band[first_valid]
+    final_lower_band[first_valid] = basic_lower_band[first_valid]
+
+    if close[first_valid] <= final_upper_band[first_valid]:
+        trend[first_valid] = -1.0
+        supertrend[first_valid] = final_upper_band[first_valid]
+    else:
+        trend[first_valid] = 1.0
+        supertrend[first_valid] = final_lower_band[first_valid]
+
+    # Recursive calculation
+    for observation_index in range(first_valid + 1, number_of_observations):
+        previous_index = observation_index - 1
+
+        # Final upper band
+        if (basic_upper_band[observation_index] < final_upper_band[previous_index]) or \
+           (close[previous_index] > final_upper_band[previous_index]):
+            final_upper_band[observation_index] = basic_upper_band[observation_index]
+        else:
+            final_upper_band[observation_index] = final_upper_band[previous_index]
+
+        # Final lower band
+        if (basic_lower_band[observation_index] > final_lower_band[previous_index]) or \
+           (close[previous_index] < final_lower_band[previous_index]):
+            final_lower_band[observation_index] = basic_lower_band[observation_index]
+        else:
+            final_lower_band[observation_index] = final_lower_band[previous_index]
+
+        # Trend transition
+        if trend[previous_index] == -1.0:
+            if close[observation_index] > final_upper_band[observation_index]:
+                trend[observation_index] = 1.0
+                supertrend[observation_index] = final_lower_band[observation_index]
+            else:
+                trend[observation_index] = -1.0
+                supertrend[observation_index] = final_upper_band[observation_index]
+        else:
+            if close[observation_index] < final_lower_band[observation_index]:
+                trend[observation_index] = -1.0
+                supertrend[observation_index] = final_upper_band[observation_index]
+            else:
+                trend[observation_index] = 1.0
+                supertrend[observation_index] = final_lower_band[observation_index]
+
+    return (
+        basic_upper_band,
+        basic_lower_band,
+        final_upper_band,
+        final_lower_band,
+        supertrend,
+        trend,
     )
+
+
+def calculate_supertrend_bands(
+    ohlcv_data: pd.DataFrame,
+    average_true_range: pd.Series,
+    multiplier: float,
+) -> Tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate the basic and final Supertrend bands.
+
+    The midpoint is:
+        HL2_t = (high_t + low_t) / 2
+
+    The basic bands are:
+        BUB_t = HL2_t + multiplier * ATR_t
+        BLB_t = HL2_t - multiplier * ATR_t
+
+    The final upper band is recursive:
+        FUB_t = BUB_t if BUB_t < FUB_{t-1} or close_{t-1} > FUB_{t-1} else FUB_{t-1}
+
+    The final lower band is recursive:
+        FLB_t = BLB_t if BLB_t > FLB_{t-1} or close_{t-1} < FLB_{t-1} else FLB_{t-1}
+
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        OHLCV data containing "high", "low", and "close".
+
+    average_true_range : pd.Series
+        Wilder's Average True Range, aligned with `ohlcv_data`.
+
+    multiplier : float
+        ATR multiplier used to determine the distance of the bands
+        from the midpoint.
+
+    Returns
+    -------
+    Tuple[pd.Series, pd.Series, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Returns raw upper band, raw lower band, final upper band, final lower band,
+        supertrend line, and trend state (-1.0 or +1.0).
+
+    Raises
+    ------
+    ValueError
+        If no valid ATR observations are available, or multiplier is invalid.
+    """
+
+    if multiplier <= 0:
+        raise ValueError("multiplier must be greater than zero.")
+
+    high = ohlcv_data["high"].to_numpy(dtype=np.float64)
+    low = ohlcv_data["low"].to_numpy(dtype=np.float64)
+    close = ohlcv_data["close"].to_numpy(dtype=np.float64)
+    average_true_range_array = average_true_range.to_numpy(dtype=np.float64)
+    number_of_observations = len(close)
+
+    valid_indices = np.flatnonzero(~np.isnan(average_true_range_array))
+    if len(valid_indices) == 0:
+        raise ValueError("No valid ATR observations. Check the input data and atr_period.")
+    
+    first_valid = valid_indices[0]
+
+    # Pass entirely to the Numba JIT compiler
+    return _calculate_supertrend_bands_core(
+        high=high,
+        low=low,
+        close=close,
+        average_true_range_array=average_true_range_array,
+        multiplier=multiplier,
+        number_of_observations=number_of_observations,
+        first_valid=first_valid,
+    )
+
 
 
 def calculate_supertrend(
