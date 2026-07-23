@@ -26,6 +26,11 @@ REQUIRED_COLUMNS: set[str] = {
 }
 
 
+# ============================================================
+# Functions
+# ============================================================
+
+
 def list_ohlcv_files(data_dir: Path = DATA_DIR) -> List[Path]:
     """
     Discover all CSV files containing OHLCV data.
@@ -144,23 +149,19 @@ def validate_ohlcv_schema(data: pd.DataFrame) -> None:
             f"{sorted(missing_columns)}"
         )
 
-
 def load_ohlcv_data(filepaths: Sequence[Path]) -> pd.DataFrame:
     """
-    Load, standardise, concatenate, and chronologically sort
+    Load, concatenate, validate schema, and chronologically sort
     multiple OHLCV CSV files.
 
     Processing steps
     ----------------
-    1. Load each CSV file.
-    2. Standardise column names.
-    3. Validate the required schema.
-    4. Add the source filename.
-    5. Concatenate all files.
-    6. Parse timestamps.
-    7. Remove rows with invalid timestamps.
-    8. Sort chronologically.
-    9. Set timestamp as the index.
+    1. Load each CSV file (column standardization happens in load_ohlcv_file).
+    2. Validate the required schema.
+    3. Add the source filename.
+    4. Concatenate all files.
+    5. Parse timestamps and validate.
+    6. Sort chronologically and set timestamp index.
 
     Parameters
     ----------
@@ -179,109 +180,34 @@ def load_ohlcv_data(filepaths: Sequence[Path]) -> pd.DataFrame:
     """
 
     if not filepaths:
-        raise ValueError(
-            "No filepaths were provided."
-        )
+        raise ValueError("No filepaths were provided.")
 
     ohlcv_dfs: list[pd.DataFrame] = []
 
     for filepath in filepaths:
+        # load_ohlcv_file handles reading, empty checks, and column standardization
+        ohlcv_df = load_ohlcv_file(filepath)
 
-        ohlcv_df = load_ohlcv_file(
-            filepath
-        )
+        validate_ohlcv_schema(ohlcv_df)
 
-        validate_ohlcv_schema(
-            ohlcv_df
-        )
+        ohlcv_df["source_file"] = filepath.name
 
-        ohlcv_df["source_file"] = (
-            filepath.name
-        )
+        ohlcv_dfs.append(ohlcv_df)
 
-        ohlcv_dfs.append(
-            ohlcv_df
-        )
-
-    ohlcv_data = pd.concat(
-        ohlcv_dfs,
-        ignore_index=True,
-    )
+    ohlcv_data = pd.concat(ohlcv_dfs, ignore_index=True)
 
     # Parse timestamps
-    ohlcv_data["time"] = pd.to_datetime(
-        ohlcv_data["time"],
-        errors="coerce",
-    )
+    ohlcv_data["time"] = pd.to_datetime(ohlcv_data["time"], errors="coerce")
 
-    invalid_timestamps = (
-        ohlcv_data["time"].isna()
-    )
-
+    invalid_timestamps = ohlcv_data["time"].isna()
     if invalid_timestamps.any():
-
-        n_invalid = (
-            invalid_timestamps.sum()
-        )
-
-        raise ValueError(
-            f"Found {n_invalid} invalid timestamps."
-        )
+        n_invalid = invalid_timestamps.sum()
+        raise ValueError(f"Found {n_invalid} invalid timestamps.")
 
     # Sort chronologically
-    ohlcv_data = (
-        ohlcv_data
-        .sort_values("time")
-        .set_index("time")
-    )
+    ohlcv_data = ohlcv_data.sort_values("time").set_index("time")
 
     return ohlcv_data
-
-
-def select_time_window(
-    ohlcv_data: pd.DataFrame,
-    start: str,
-    end: str,
-) -> pd.DataFrame:
-    """
-    Select a time interval from an OHLCV DataFrame.
-
-    Parameters
-    ----------
-    ohlcv_data : pd.DataFrame
-        OHLCV data indexed by a DatetimeIndex.
-
-    start : str
-        Start timestamp accepted by pandas.
-
-    end : str
-        End timestamp accepted by pandas.
-
-    Returns
-    -------
-    pd.DataFrame
-        Copy of the data between `start` and `end`, inclusive.
-
-    Raises
-    ------
-    TypeError
-        If the input does not have a DatetimeIndex.
-    """
-
-    if not isinstance(
-        ohlcv_data.index,
-        pd.DatetimeIndex,
-    ):
-        raise TypeError(
-            "ohlcv_data must have a "
-            "pandas DatetimeIndex."
-        )
-
-    return (
-        ohlcv_data
-        .loc[start:end]
-        .copy()
-    )
 
 
 
@@ -461,18 +387,13 @@ def analyse_timestamp_structure(
 
 def analyse_ohlcv_data(ohlcv_data: pd.DataFrame) -> None:
     """
-    Print a comprehensive data-quality report for OHLCV data.
+    Print a data-quality report for OHLCV data.
 
     The report includes:
 
         - DataFrame structure and memory usage;
         - descriptive statistics;
         - missing-value counts;
-        - OHLC consistency checks;
-        - timestamp range;
-        - duplicate timestamps;
-        - temporal gaps;
-        - observations per year.
 
     Parameters
     ----------
@@ -505,81 +426,89 @@ def analyse_ohlcv_data(ohlcv_data: pd.DataFrame) -> None:
     print(
         ohlcv_data.isna().sum()
     )
+    
 
-    print("\nOHLC CONSISTENCY")
-    print("=" * 60)
 
-    invalid_high = (
-        ohlcv_data["high"]
-        <
-        ohlcv_data[
-            ["open", "close"]
-        ].max(axis=1)
-    )
+def run_data_pipeline(
+    data_dir: Path = DATA_DIR,
+    print_report: bool = True
+) -> pd.DataFrame:
+    """
+    Master pipeline function to discover, load, strictly validate, 
+    and analyze all OHLCV data within a target directory.
 
-    invalid_low = (
-        ohlcv_data["low"]
-        >
-        ohlcv_data[
-            ["open", "close"]
-        ].min(axis=1)
-    )
+    Parameters
+    ----------
+    data_dir : Path, default=DATA_DIR
+        Directory containing the OHLCV CSV files.
+    print_report : bool, default=True
+        Whether to print the standalone data quality reports.
 
-    invalid_range = (
-        ohlcv_data["high"]
-        <
-        ohlcv_data["low"]
-    )
+    Returns
+    -------
+    pd.DataFrame
+        A strictly validated, chronologically sorted OHLCV DataFrame.
+    """
+    
+    # 1. Discover and Load
+    csv_filepaths = list_ohlcv_files(data_dir=data_dir)
+    ohlcv_data = load_ohlcv_data(filepaths=csv_filepaths)
+    
+    # 2. Strict Validation (Will raise errors and halt if data is corrupt)
+    validate_numeric_columns(data=ohlcv_data)
+    validate_ohlc_relationships(data=ohlcv_data)
+    
+    # 3. Standalone Analysis
+    if print_report:
+        analyse_ohlcv_data(ohlcv_data=ohlcv_data)
+        print("\n")
+        analyse_timestamp_structure(data=ohlcv_data)
+        
+    return ohlcv_data
+    
 
-    print(
-        "Invalid high values:",
-        invalid_high.sum(),
-    )
 
-    print(
-        "Invalid low values:",
-        invalid_low.sum(),
-    )
+def select_time_window(
+    ohlcv_data: pd.DataFrame,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    """
+    Select a time interval from an OHLCV DataFrame.
 
-    print(
-        "Invalid high < low:",
-        invalid_range.sum(),
-    )
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        OHLCV data indexed by a DatetimeIndex.
 
-    print("\nTIMESTAMP STRUCTURE")
-    print("=" * 60)
+    start : str
+        Start timestamp accepted by pandas.
 
-    print(
-        "Starting timestamp:",
-        ohlcv_data.index.min(),
-    )
+    end : str
+        End timestamp accepted by pandas.
 
-    print(
-        "Ending timestamp:",
-        ohlcv_data.index.max(),
-    )
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the data between `start` and `end`, inclusive.
 
-    print(
-        "Duplicate timestamps:",
-        ohlcv_data.index.duplicated().sum(),
-    )
+    Raises
+    ------
+    TypeError
+        If the input does not have a DatetimeIndex.
+    """
 
-    print("\nMOST COMMON TIME DIFFERENCES")
-    print("=" * 60)
+    if not isinstance(
+        ohlcv_data.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "ohlcv_data must have a "
+            "pandas DatetimeIndex."
+        )
 
-    print(
-        ohlcv_data.index
-        .to_series()
-        .diff()
-        .value_counts()
-        .head(20)
-    )
-
-    print("\nOBSERVATIONS PER YEAR")
-    print("=" * 60)
-
-    print(
-        ohlcv_data.groupby(
-            ohlcv_data.index.year
-        ).size()
+    return (
+        ohlcv_data
+        .loc[start:end]
+        .copy()
     )

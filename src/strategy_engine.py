@@ -22,7 +22,7 @@ Trade construction
 
 Long:
 
-    entry_price = close_t
+    entry_price = open_t+1
 
     stop_loss = low_t
 
@@ -33,7 +33,7 @@ Long:
 
 Short:
 
-    entry_price = close_t
+    entry_price = open_t+1
 
     stop_loss = high_t
 
@@ -43,6 +43,11 @@ Short:
 
 The entry candle is not used to monitor the stop-loss or take-profit.
 Trade monitoring begins from the following candle.
+
+Note
+----
+
+There are now additional criteria for generating entry signal. This was done to avoid false positives.
 
 This module assumes that the input data is chronologically sorted.
 """
@@ -132,12 +137,12 @@ def _validate_backtest_columns(
 
 def generate_signals(
     supertrend_data: pd.DataFrame,
-    penetration_model: Literal["ticks", "atr_frac"] = "ticks",
+    penetration_model: Literal["ticks", "atr_fraction"] = "ticks",
     penetration_ticks: int = 1,
     tick_size: float = 0.01,
-    min_penetration_atr_fraction: float = 0.2,
+    penetration_atr_fraction: float = 0.2,
     sensitivity_scalar: float = 1.0,
-    squashing_function: Literal["tanh", "relu"] = "tanh",
+    squashing_type: Literal["tanh", "relu"] = "tanh",
     volume_multiplier: float = 1.5,
     volume_ma_period: int = 20,
 ) -> pd.DataFrame:
@@ -150,7 +155,7 @@ def generate_signals(
     A long signal is generated at observation t when:
         - trend_t = +1
         - low_t <= supertrend_t - (penetration_ticks * tick_size)
-        - (supertrend_t - low_t) >= min_penetration_atr_fraction * atr_t
+        - (supertrend_t - low_t) >= penetration_atr_fraction * atr_t
         - close_t > supertrend_t
         - volume_t >= volume_multiplier * MovingAverage(Volume, volume_ma_period)
 
@@ -159,7 +164,7 @@ def generate_signals(
     A short signal is generated at observation t when:
         - trend_t = -1
         - high_t >= supertrend_t + (penetration_ticks * tick_size)
-        - (high_t - supertrend_t) >= min_penetration_atr_fraction * atr_t
+        - (high_t - supertrend_t) >= penetration_atr_fraction * atr_t
         - close_t < supertrend_t
         - volume_t >= volume_multiplier * MovingAverage(Volume, volume_ma_period)
 
@@ -172,17 +177,17 @@ def generate_signals(
     supertrend_data : pd.DataFrame
         OHLCV data containing "low", "high", "close", "supertrend", "trend", "atr", 
         and optionally a volume column ("tick_volume" or "volume").
-    penetration_model: ticks or atr_frac
+    penetration_model: ticks or atr_fraction
         Choose whether to use fixed number of ticks or a fraction of the atr for penetration condition.
     penetration_ticks: int, default=1
         Minimum absolute tick buffer for Supertrend violation.
     tick_size: float, default=0.01
         The minimum price movement of the asset.
-    min_penetration_atr_fraction: float, default=0.2
+    penetration_atr_fraction: float, default=0.2
         The minimum required penetration depth expressed as a fraction of the current ATR.
     sensitivity_scalar: float, default=1.0
         Multiplier for the normalized gap before squashing.
-    squashing_function: {"tanh", "relu"}, default="tanh"
+    squashing_type: {"tanh", "relu"}, default="tanh"
         The function used to squash signal strength to a value between [0, 1].
     volume_multiplier: float, default=1.5
         The minimum multiple of baseline volume required to confirm a liquidity sweep.
@@ -231,15 +236,15 @@ def generate_signals(
         volume_condition = np.ones(len(signal_data), dtype=bool)
 
     # ATR-normalized depth conditions
-    long_depth_condition = (supertrend_arr - low_arr) >= (min_penetration_atr_fraction * atr_arr)
-    short_depth_condition = (high_arr - supertrend_arr) >= (min_penetration_atr_fraction * atr_arr)
+    long_depth_condition = (supertrend_arr - low_arr) >= (penetration_atr_fraction * atr_arr)
+    short_depth_condition = (high_arr - supertrend_arr) >= (penetration_atr_fraction * atr_arr)
 
     # 4. Generate directional signals incorporating institutional filters
     long_signal = (
         valid_supertrend &
         (trend_arr == 1) &
         (low_arr <= supertrend_arr - (penetration_ticks * tick_size)) &
-        (long_depth_condition if penetration_model == "atr_frac" else 1) &
+        (long_depth_condition if penetration_model == "atr_fraction" else 1) &
         (close_arr > supertrend_arr) &
         volume_condition
     )
@@ -248,7 +253,7 @@ def generate_signals(
         valid_supertrend &
         (trend_arr == -1) &
         (high_arr >= supertrend_arr + (penetration_ticks * tick_size)) &
-        (short_depth_condition if penetration_model == "atr_frac" else 1) &
+        (short_depth_condition if penetration_model == "atr_fraction" else 1) &
         (close_arr < supertrend_arr) &
         volume_condition
     )
@@ -270,417 +275,17 @@ def generate_signals(
     epsilon = 1e-8
     normalized_gap = raw_gap / (atr_arr + epsilon)
     
-    if squashing_function == "tanh":
+    if squashing_type == "tanh":
         strength = np.tanh(sensitivity_scalar * normalized_gap)
-    elif squashing_function == "relu":
+    elif squashing_type == "relu":
         strength = np.clip(sensitivity_scalar * normalized_gap, 0.0, 1.0)
     else:
-        raise ValueError("squashing_function must be 'tanh' or 'relu'")
+        raise ValueError("squashing_type must be 'tanh' or 'relu'")
     
     valid_mask = active_signals & ~np.isnan(breakout_arr)
     signal_data["signal_strength"] = np.where(valid_mask, strength, 0.0)
 
     return signal_data
-
-
-    
-'''def generate_signals(
-    supertrend_data: pd.DataFrame,
-    penetration_ticks: int = 1,
-    tick_size: float = 0.01,
-    squashing_function: Literal["tanh", "relu"] = "tanh",
-) -> pd.DataFrame:
-    """
-    Generate entry signals for the Supertrend Failed Breakout strategy.
-
-    Long entry condition
-    --------------------
-
-    A long signal is generated at observation t when:
-
-        trend_t = +1
-
-        low_t <= supertrend_t
-
-        close_t > supertrend_t
-
-    Therefore, the candle must touch or penetrate the Supertrend line
-    intrabar, but ultimately close above it.
-
-    Short entry condition
-    ---------------------
-
-    A short signal is generated at observation t when:
-
-        trend_t = -1
-
-        high_t >= supertrend_t
-
-        close_t < supertrend_t
-
-    Therefore, the candle must touch or penetrate the Supertrend line
-    intrabar, but ultimately close below it.
-
-    The signals are generated using only information available from the
-    current candle. The strategy therefore assumes that execution occurs
-    at the close of the signal candle.
-
-    Parameters
-    ----------
-    supertrend_data : pd.DataFrame
-        OHLCV data containing:
-
-            - "low"
-            - "high"
-            - "close"
-            - "supertrend"
-            - "trend"
-    penetration_ticks: int
-        Number of ticks between the supertrend and the high/low for penetration to be significant/accepted.
-
-    tick_size: float
-        The minimum price movement of the asset.
-
-    squashing_function: tanh or relu
-        The squashing function used to squash signal strength to a value between 0 and 1.
-        
-    Returns
-    -------
-    pd.DataFrame
-        Copy of the input DataFrame with two additional Boolean columns:
-
-            - "long_signal"
-            - "short_signal"
-            - "breakout_price"
-            - "signal_strength"
-
-    Notes
-    -----
-    The input DataFrame is not modified.
-
-    Signals are not generated when the Supertrend value is NaN, which
-    normally occurs during the ATR warm-up period.
-    """
-
-    _validate_signal_columns(
-        supertrend_data
-    )
-
-    signal_data = (
-        supertrend_data.copy()
-    )
-
-    valid_supertrend = (
-        signal_data["supertrend"]
-        .notna()
-    )
-    trend_arr = signal_data["trend"].to_numpy()
-    supertrend_arr = signal_data["supertrend"].to_numpy()
-    close_arr = signal_data["close"].to_numpy()
-    low_arr = signal_data["low"].to_numpy()
-    high_arr = signal_data["high"].to_numpy()
-    atr_arr = signal_data["atr"].to_numpy()
-    
-
-    signal_data["long_signal"] = (
-        valid_supertrend
-        &
-        (
-            trend_arr
-            == 1
-        )
-        &
-        (
-            low_arr
-            <=
-            supertrend_arr - penetration_ticks * tick_size
-        )
-        &
-        (
-            close_arr
-            >
-            supertrend_arr
-        )
-    )
-
-    signal_data["short_signal"] = (
-        valid_supertrend
-        &
-        (
-            trend_arr
-            == -1
-        )
-        &
-        (
-            high_arr
-            >=
-            supertrend_arr + penetration_ticks * tick_size
-        )
-        &
-        (
-            close_arr
-            <
-            supertrend_arr
-        )
-    )
-
-    # 1. Create the boolean mask for active signals (using bitwise OR)
-    active_signals = signal_data["long_signal"].to_numpy() | signal_data["short_signal"].to_numpy()
-    
-    # 2. Calculate gaps (vectorized math is faster than masking the array first)
-    raw_gap = np.abs(close_arr - breakout_arr)
-    epsilon = 1e-8
-    normalized_gap = raw_gap / (atr_arr + epsilon)
-    
-    # 4. Apply the squashing function
-    strength = np.tanh(sensitivity_scalar * normalized_gap)
-    
-    # 5. Apply the mask: keep strength ONLY if it's an active signal AND breakout isn't NaN
-    valid_mask = active_signals & ~np.isnan(breakout_arr)
-    signal_data["signal_strength"] = np.where(valid_mask, strength, 0.0)
-
-    return signal_data'''
-
-
-
-
-'''def backtest_strategy(
-    signal_data: pd.DataFrame,
-    reward_risk: float = 2.0,
-    same_bar_priority: Literal["stop", "target"] = "stop",
-    slippage_ticks: float = 0.0,
-    tick_size: float = 0.01,
-) -> pd.DataFrame:
-    """
-    Backtest the Supertrend Failed Breakout strategy using fast NumPy iteration.
-
-    Entry (Corrected for Look-Ahead Bias)
-    -------------------------------------
-    A signal is generated based on the closing price of observation t.
-    Because the close must be confirmed, the trade is executed at the OPEN of 
-    the following candle (t + 1), incorporating transaction slippage.
-
-    Long entry:
-        entry_price = open_{t+1} + (slippage_ticks * tick_size)
-
-    Short entry:
-        entry_price = open_{t+1} - (slippage_ticks * tick_size)
-
-    Trade construction
-    ------------------
-    The stop loss is anchored to the extremes of the signal candle (t).
-
-    Long:
-        stop_loss = low_t
-        risk = entry_price - stop_loss
-        take_profit = entry_price + reward_risk * risk
-
-    Short:
-        stop_loss = high_t
-        risk = stop_loss - entry_price
-        take_profit = entry_price - reward_risk * risk
-
-    Trade management
-    ----------------
-    Only one position may be open at a time. Monitoring begins immediately on 
-    the execution candle (t+1). If both stop-loss and take-profit are touched 
-    during the same candle, the result is determined by `same_bar_priority`.
-    Slippage is applied upon exiting the position.
-
-    Parameters
-    ----------
-    signal_data : pd.DataFrame
-        Chronologically sorted OHLCV data containing:
-            - "open", "low", "high", "close", "long_signal", "short_signal"
-    reward_risk : float, default=2.0
-        Reward-to-risk ratio.
-    same_bar_priority : {"stop", "target"}, default="stop"
-        Outcome when both stop-loss and take-profit are reached within the same bar.
-    slippage_ticks : float, default=0.0
-        Execution penalty defined in ticks (e.g., bid-ask spread friction).
-    tick_size : float, default=0.01
-        The minimum price movement of the asset.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per completed trade.
-    """
-
-    _validate_backtest_columns(signal_data)
-
-    if reward_risk <= 0:
-        raise ValueError("reward_risk must be greater than zero.")
-
-    if same_bar_priority not in {"stop", "target"}:
-        raise ValueError("same_bar_priority must be 'stop' or 'target'.")
-
-    trades_data: list[dict] = []
-    open_position: dict | None = None
-    number_of_observations = len(signal_data)
-
-    # Extract pandas columns to underlying NumPy arrays for extreme speed O(1) lookups
-    opens = signal_data["open"].to_numpy(dtype=np.float64)
-    highs = signal_data["high"].to_numpy(dtype=np.float64)
-    lows = signal_data["low"].to_numpy(dtype=np.float64)
-    long_signals = signal_data["long_signal"].to_numpy(dtype=bool)
-    short_signals = signal_data["short_signal"].to_numpy(dtype=bool)
-    timestamps = signal_data.index.to_numpy()
-
-    for observation_index in range(number_of_observations):
-
-        # ==================================================
-        # NO OPEN POSITION
-        # ==================================================
-        if open_position is None:
-
-            # Cannot execute a new trade if we are on the final dataset observation
-            if observation_index + 1 >= number_of_observations:
-                continue
-
-            # ----------------------------------------------
-            # Long entry
-            # ----------------------------------------------
-            if long_signals[observation_index]:
-                entry_index = observation_index + 1
-                entry_time = timestamps[entry_index]
-                
-                # Execute on the open of the next bar, penalize with slippage
-                entry_price = opens[entry_index] + (slippage_ticks * tick_size)
-                
-                # Stop loss anchored to the signal bar's low
-                stop_loss = lows[observation_index]
-                risk = entry_price - stop_loss
-                
-                if risk <= 0:
-                    continue  # Gap opened past our intended stop loss
-                    
-                take_profit = entry_price + (reward_risk * risk)
-                
-                open_position = {
-                    "direction": "long",
-                    "entry_time": entry_time,
-                    "entry_index": entry_index,
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "risk": risk,
-                }
-                continue
-
-            # ----------------------------------------------
-            # Short entry
-            # ----------------------------------------------
-            if short_signals[observation_index]:
-                entry_index = observation_index + 1
-                entry_time = timestamps[entry_index]
-                
-                # Execute on the open of the next bar, penalize with slippage
-                entry_price = opens[entry_index] - (slippage_ticks * tick_size)
-                
-                # Stop loss anchored to the signal bar's high
-                stop_loss = highs[observation_index]
-                risk = stop_loss - entry_price
-                
-                if risk <= 0:
-                    continue  # Gap opened past our intended stop loss
-                    
-                take_profit = entry_price - (reward_risk * risk)
-                
-                open_position = {
-                    "direction": "short",
-                    "entry_time": entry_time,
-                    "entry_index": entry_index,
-                    "entry_price": entry_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                    "risk": risk,
-                }
-                continue
-
-        # ==================================================
-        # MANAGE OPEN POSITION
-        # ==================================================
-        else:
-            current_high = highs[observation_index]
-            current_low = lows[observation_index]
-            current_timestamp = timestamps[observation_index]
-
-            exit_reason = None
-            exit_price = None
-
-            # --------------------------------------------------
-            # Long position
-            # --------------------------------------------------
-            if open_position["direction"] == "long":
-                stop_hit = current_low <= open_position["stop_loss"]
-                target_hit = current_high >= open_position["take_profit"]
-
-                if stop_hit and target_hit:
-                    if same_bar_priority == "stop":
-                        exit_reason = "stop_loss"
-                        exit_price = open_position["stop_loss"]
-                    else:
-                        exit_reason = "take_profit"
-                        exit_price = open_position["take_profit"]
-                elif stop_hit:
-                    exit_reason = "stop_loss"
-                    exit_price = open_position["stop_loss"]
-                elif target_hit:
-                    exit_reason = "take_profit"
-                    exit_price = open_position["take_profit"]
-                else:
-                    continue
-
-                # Apply friction to the exit
-                exit_price -= (slippage_ticks * tick_size)
-                pnl = exit_price - open_position["entry_price"]
-
-            # --------------------------------------------------
-            # Short position
-            # --------------------------------------------------
-            else:
-                stop_hit = current_high >= open_position["stop_loss"]
-                target_hit = current_low <= open_position["take_profit"]
-
-                if stop_hit and target_hit:
-                    if same_bar_priority == "stop":
-                        exit_reason = "stop_loss"
-                        exit_price = open_position["stop_loss"]
-                    else:
-                        exit_reason = "take_profit"
-                        exit_price = open_position["take_profit"]
-                elif stop_hit:
-                    exit_reason = "stop_loss"
-                    exit_price = open_position["stop_loss"]
-                elif target_hit:
-                    exit_reason = "take_profit"
-                    exit_price = open_position["take_profit"]
-                else:
-                    continue
-                
-                # Apply friction to the exit
-                exit_price += (slippage_ticks * tick_size)
-                pnl = open_position["entry_price"] - exit_price
-
-            r_multiple = pnl / open_position["risk"]
-
-            completed_trade = {
-                **open_position,
-                "exit_time": current_timestamp,
-                "exit_index": observation_index,
-                "exit_price": exit_price,
-                "exit_reason": exit_reason,
-                "pnl": pnl,
-                "r_multiple": r_multiple,
-            }
-
-            trades_data.append(completed_trade)
-            open_position = None
-
-    return pd.DataFrame(trades_data)'''
-
-
 
 
 def backtest_strategy(
@@ -1107,3 +712,86 @@ def calculate_performance(
     })
 
     return performance_metrics, performance_plot_data
+
+
+def run_strategy_pipeline(
+    supertrend_data: pd.DataFrame,
+    # --- Shared Parameters ---
+    tick_size: float = 0.01,
+    initial_capital: float = 1000000.0,
+    trading_days_per_year: int = 252,
+    
+    # --- Signal Parameters ---
+    penetration_model: Literal["ticks", "atr_fraction"] = "ticks",
+    penetration_ticks: int = 1,
+    penetration_atr_fraction: float = 0.2,
+    sensitivity_scalar: float = 1.0,
+    squashing_type: Literal["tanh", "relu"] = "tanh",
+    volume_multiplier: float = 1.5,
+    volume_ma_period: int = 20,
+    
+    # --- Backtest Parameters ---
+    reward_risk: float = 2.0,
+    stop_loss_ratio: float = 1.0,
+    position_sizing: Literal["fixed", "weighted"] = "fixed",
+    max_position_per_trade_fraction: float = 0.01,
+    max_risk_per_trade_fraction: float = 0.001,
+    min_holdings_fraction: float = 0.80,
+    transaction_costs_model: Literal["flat", "percentage"] = "percentage",
+    transaction_costs_flat: float = 2.50,
+    transaction_costs_fraction: float = 0.0005,
+    same_bar_priority: Literal["stop", "target"] = "stop",
+    slippage_ticks: int = 0,
+    
+    # --- Performance Parameters ---
+    risk_free_rate: float = 0.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], pd.DataFrame]:
+    """
+    Master pipeline that orchestrates signal generation, backtesting, 
+    and performance metric calculations in a single synced pass.
+    """
+
+    # 1. Validate and Generate Signals
+    _validate_signal_columns(supertrend_data)
+    
+    signal_data = generate_signals(
+        supertrend_data=supertrend_data,
+        penetration_model=penetration_model,
+        penetration_ticks=penetration_ticks,
+        tick_size=tick_size,  # Passed from shared parameters
+        penetration_atr_fraction=penetration_atr_fraction,
+        sensitivity_scalar=sensitivity_scalar,
+        squashing_type=squashing_type,
+        volume_multiplier=volume_multiplier,
+        volume_ma_period=volume_ma_period,
+    )
+
+    # 2. Validate and Run Backtest Engine
+    _validate_backtest_columns(signal_data)
+    
+    trades_data = backtest_strategy(
+        signal_data=signal_data,
+        initial_capital=initial_capital,  # Passed from shared parameters
+        reward_risk=reward_risk,
+        stop_loss_ratio=stop_loss_ratio,
+        position_sizing=position_sizing,
+        max_position_per_trade_fraction=max_position_per_trade_fraction,
+        max_risk_per_trade_fraction=max_risk_per_trade_fraction,
+        min_holdings_fraction=min_holdings_fraction,
+        transaction_costs_model=transaction_costs_model,
+        transaction_costs_flat=transaction_costs_flat,
+        transaction_costs_fraction=transaction_costs_fraction,
+        same_bar_priority=same_bar_priority,
+        slippage_ticks=slippage_ticks,
+        tick_size=tick_size,  # Passed from shared parameters
+    )
+
+    # 3. Calculate Performance Metrics
+    metrics, plot_data = calculate_performance(
+        trades_data=trades_data,
+        initial_capital=initial_capital,  # Passed from shared parameters
+        risk_free_rate=risk_free_rate,
+        trading_days_per_year=trading_days_per_year,
+    )
+
+    return signal_data, trades_data, metrics, plot_data

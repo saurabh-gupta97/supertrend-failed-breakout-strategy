@@ -24,6 +24,7 @@ def calculate_average_true_range(
     ohlcv_data: pd.DataFrame,
     atr_period: int,
     smoothing_type: Literal["RMA", "SMA", "EMA"] = "RMA",
+    ema_span: float = None,
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Calculate True Range and Wilder's Average True Range.
@@ -56,6 +57,9 @@ def calculate_average_true_range(
 
     atr_period : int
         Number of observations used for ATR calculation.
+
+    smoothing_type : {"RMA", "SMA", "EMA"}, default="RMA"
+        The moving average type used to smooth the True Range.
 
     Returns
     -------
@@ -136,7 +140,10 @@ def calculate_average_true_range(
         average_true_range = true_range.rolling(window=atr_period).mean()
     elif smoothing_type == "EMA":
         # Standard Exponential Moving Average
-        average_true_range = true_range.ewm(span=atr_period, adjust=False).mean()
+        if ema_span == None:
+            average_true_range = true_range.ewm(span=atr_period, adjust=False).mean()
+        else:
+            average_true_range = true_range.ewm(span=ema_span, adjust=False).mean()
     else:
         raise ValueError("smoothing_type must be 'RMA', 'SMA', or 'EMA'")
 
@@ -274,13 +281,13 @@ def calculate_supertrend_bands(
     if multiplier <= 0:
         raise ValueError("multiplier must be greater than zero.")
 
-    high = ohlcv_data["high"].to_numpy(dtype=np.float64)
-    low = ohlcv_data["low"].to_numpy(dtype=np.float64)
-    close = ohlcv_data["close"].to_numpy(dtype=np.float64)
-    average_true_range_array = average_true_range.to_numpy(dtype=np.float64)
-    number_of_observations = len(close)
+    high_arr = ohlcv_data["high"].to_numpy(dtype=np.float64)
+    low_arr = ohlcv_data["low"].to_numpy(dtype=np.float64)
+    close_arr = ohlcv_data["close"].to_numpy(dtype=np.float64)
+    average_true_range_arr = average_true_range.to_numpy(dtype=np.float64)
+    number_of_observations = len(close_arr)
 
-    valid_indices = np.flatnonzero(~np.isnan(average_true_range_array))
+    valid_indices = np.flatnonzero(~np.isnan(average_true_range_arr))
     if len(valid_indices) == 0:
         raise ValueError("No valid ATR observations. Check the input data and atr_period.")
     
@@ -288,10 +295,10 @@ def calculate_supertrend_bands(
 
     # Pass entirely to the Numba JIT compiler
     return _calculate_supertrend_bands_core(
-        high=high,
-        low=low,
-        close=close,
-        average_true_range_array=average_true_range_array,
+        high=high_arr,
+        low=low_arr,
+        close=close_arr,
+        average_true_range_array=average_true_range_arr,
         multiplier=multiplier,
         number_of_observations=number_of_observations,
         first_valid=first_valid,
@@ -299,10 +306,10 @@ def calculate_supertrend_bands(
 
 
 
-def calculate_supertrend(
+'''def calculate_supertrend(
     ohlcv_data: pd.DataFrame,
     atr_period: int = 10,
-    averaging_method: str = "ewm",
+    smoothing_type: Literal["RMA", "SMA", "EMA"] = "RMA",
     multiplier: float = 3.0,
 ) -> pd.DataFrame:
     """
@@ -337,6 +344,9 @@ def calculate_supertrend(
 
     atr_period : int, default=10
         Number of observations used in the ATR calculation.
+
+    smoothing_type : {"RMA", "SMA", "EMA"}, default="RMA"
+        The moving average type used to smooth the True Range.
 
     multiplier : float, default=3.0
         ATR multiplier used to construct the Supertrend bands.
@@ -443,5 +453,76 @@ def calculate_supertrend(
         trend
     )
 
-    return supertrend_data
+    return supertrend_data'''
 
+
+def generate_supertrend(
+    ohlcv_data: pd.DataFrame,
+    atr_period: int = 10,
+    multiplier: float = 3.0,
+    smoothing_type: Literal["RMA", "SMA", "EMA"] = "RMA"
+) -> pd.DataFrame:
+    """
+    Master pipeline function to calculate the Supertrend indicator.
+
+    This function sequentially calculates the True Range, applies the 
+    specified smoothing to generate the Average True Range (ATR), computes 
+    the recursive bands via the Numba JIT-compiled core, and appends all 
+    resulting columns to the DataFrame.
+
+    Parameters
+    ----------
+    ohlcv_data : pd.DataFrame
+        OHLCV data containing "high", "low", and "close".
+    atr_period : int, default=10
+        Lookback window for the Average True Range.
+    multiplier : float, default=3.0
+        ATR multiplier used to determine the distance of the bands.
+    smoothing_type : {"RMA", "SMA", "EMA"}, default="RMA"
+        The moving average type used to smooth the True Range.
+
+    Returns
+    -------
+    pd.DataFrame
+        A copy of the input DataFrame appended with:
+            - "true_range", "atr"
+            - "basic_upper_band", "basic_lower_band"
+            - "final_upper_band", "final_lower_band"
+            - "supertrend", "trend"
+    """
+    
+    # 1. Calculate True Range and ATR
+    true_range, average_true_range = calculate_average_true_range(
+        ohlcv_data=ohlcv_data,
+        atr_period=atr_period,
+        smoothing_type=smoothing_type
+    )
+    
+    # 2. Calculate the recursive Supertrend Bands and Regime
+    (
+        basic_upper_band,
+        basic_lower_band,
+        final_upper_band,
+        final_lower_band,
+        supertrend,
+        trend,
+    ) = calculate_supertrend_bands(
+        ohlcv_data=ohlcv_data,
+        average_true_range=average_true_range,
+        multiplier=multiplier,
+    )
+    
+    # 3. Create a copy to prevent SettingWithCopy warnings
+    supertrend_data = ohlcv_data.copy()
+    
+    # 4. Append calculated quantities
+    supertrend_data["true_range"] = true_range
+    supertrend_data["atr"] = average_true_range
+    supertrend_data["basic_upper_band"] = basic_upper_band
+    supertrend_data["basic_lower_band"] = basic_lower_band
+    supertrend_data["final_upper_band"] = final_upper_band
+    supertrend_data["final_lower_band"] = final_lower_band
+    supertrend_data["supertrend"] = supertrend
+    supertrend_data["trend"] = trend
+    
+    return supertrend_data
