@@ -30,6 +30,7 @@ from typing import Optional, Mapping
 
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+import matplotlib.lines as mlines
 
 
 def _prepare_ohlcv_for_mplfinance(
@@ -762,62 +763,67 @@ def plot_strategy_trades(
                 ] = trade["exit_price"]
 
     # --------------------------------------------------
-    # Add markers
+    # Add markers (Conditionally)
     # --------------------------------------------------
+    
+    # The supertrend line should always be plotted
+    addplots = [supertrend_addplot]
 
-    long_entry_addplot = (
-        mpf.make_addplot(
+    # Only add Long Entries if the series is not completely empty (NaNs)
+    if not long_entry_prices.isna().all():
+        long_entry_addplot = mpf.make_addplot(
             long_entry_prices,
             type="scatter",
             marker="^",
+            color="blue",
             markersize=100,
             panel=0,
         )
-    )
+        addplots.append(long_entry_addplot)
 
-    short_entry_addplot = (
-        mpf.make_addplot(
+    # Only add Short Entries if the series is not completely empty
+    if not short_entry_prices.isna().all():
+        short_entry_addplot = mpf.make_addplot(
             short_entry_prices,
             type="scatter",
             marker="v",
+            color="black",
             markersize=100,
             panel=0,
         )
-    )
+        addplots.append(short_entry_addplot)
 
-    take_profit_exit_addplot = (
-        mpf.make_addplot(
+    # Only add Take Profit Exits if the series is not completely empty
+    if not take_profit_exit_prices.isna().all():
+        take_profit_exit_addplot = mpf.make_addplot(
             take_profit_exit_prices,
             type="scatter",
             marker="o",
+            color="green",
             markersize=60,
             panel=0,
         )
-    )
+        addplots.append(take_profit_exit_addplot)
 
-    stop_loss_exit_addplot = (
-        mpf.make_addplot(
+    # Only add Stop Loss Exits if the series is not completely empty
+    if not stop_loss_exit_prices.isna().all():
+        stop_loss_exit_addplot = mpf.make_addplot(
             stop_loss_exit_prices,
             type="scatter",
             marker="x",
+            color="red",
             markersize=80,
             panel=0,
         )
-    )
+        addplots.append(stop_loss_exit_addplot)
 
-    addplots = [
-        supertrend_addplot,
-        long_entry_addplot,
-        short_entry_addplot,
-        take_profit_exit_addplot,
-        stop_loss_exit_addplot,
-    ]
-
+    
     # --------------------------------------------------
-    # Plot
+    # Plot (Returning Figure and Axes)
     # --------------------------------------------------
-
-    mpf.plot(
+    
+    # 1. Add returnfig=True to extract the underlying matplotlib objects
+    fig, axlist = mpf.plot(
         ohlcv_plot_data,
         type="candle",
         style="charles",
@@ -831,8 +837,33 @@ def plot_strategy_trades(
         figsize=figsize,
         title=title,
         ylabel="Price",
+        returnfig=True, # <--- CRITICAL
     )
 
+    # --------------------------------------------------
+    # Construct the Legend (Proxy Artists)
+    # --------------------------------------------------
+    
+    # 2. Create proxy lines matching your markers and colors
+    # Ensure these colors match what you set in make_addplot
+    long_proxy = mlines.Line2D([], [], color="blue", marker="^", linestyle="None", markersize=10, label="Long Entry")
+    short_proxy = mlines.Line2D([], [], color="black", marker="v", linestyle="None", markersize=10, label="Short Entry")
+    tp_proxy = mlines.Line2D([], [], color="green", marker="o", linestyle="None", markersize=8, label="Take Profit")
+    sl_proxy = mlines.Line2D([], [], color="red", marker="x", linestyle="None", markersize=8, label="Stop Loss")
+    
+    # Optional: Add a proxy for the Supertrend line if you want it in the legend
+    # st_proxy = mlines.Line2D([], [], color="orange", linestyle="-", linewidth=1.5, label="Supertrend")
+
+    # 3. Attach the legend to the main price panel (axlist[0])
+    axlist[0].legend(
+        handles=[long_proxy, short_proxy, tp_proxy, sl_proxy], 
+        loc="best",           # Or use a specific location like "upper left"
+        framealpha=0.9,       # Makes the legend background slightly opaque
+        fontsize=10
+    )
+
+    # 4. Explicitly render the figure
+    mpf.show()
 
 
 def plot_cumulative_pnl(
