@@ -241,7 +241,7 @@ def run_walk_forward_cross_validation(
         initial_capital=initial_capital
     )
     
-    print("\n✅ Walk-Forward Cross-Validation Complete.")
+    print("\nWalk-Forward Cross-Validation Complete.")
     return (
         global_test_supertrend, 
         global_test_signals, 
